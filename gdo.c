@@ -126,6 +126,9 @@ static const uint32_t MOVE_TO_TARGET_TOGGLE_DANCE_MS = 1000;
 // Security+ 1.0 stop while closing: the second press is sent only if the opener reports
 // opening within this window of the first. Past it the reversal is left alone (door opens).
 static const uint32_t V1_STOP_REVERSE_WINDOW_MS = 3000;
+// Minimum time from the first press to the second; the opener ignores a press too soon after
+// the one that reversed it.
+static const uint32_t V1_STOP_SECOND_PRESS_MIN_MS = 1000;
 
 // Security+ 2.0 obstruction timing, measured on a live opener (see issue #28):
 //   - each frame is retransmitted ~74ms apart (same rolling code);
@@ -1884,9 +1887,18 @@ static void update_door_state(const gdo_door_state_t door_state) {
         if (door_state == GDO_DOOR_STATE_OPENING) {
             g_v1_stop_pending_ms = 0;
             if (elapsed <= V1_STOP_REVERSE_WINDOW_MS) {
-                ESP_LOGI(TAG, "Stop while closing: reversed after %" PRIu32 "ms, pressing again to stop", elapsed);
-                if (send_door_action(GDO_DOOR_ACTION_STOP) != ESP_OK) {
-                    ESP_LOGE(TAG, "Failed to send the second press to stop the door");
+                // The opener reports opening ~150 ms after the press but ignores a press
+                // that soon (seen on hardware), so space it from the first one.
+                uint32_t delay_ms = elapsed < V1_STOP_SECOND_PRESS_MIN_MS ?
+                                    V1_STOP_SECOND_PRESS_MIN_MS - elapsed : 1;
+                ESP_LOGW(TAG, "Stop while closing: reversed after %" PRIu32 "ms, pressing again in %" PRIu32 "ms",
+                         elapsed, delay_ms);
+                gdo_sched_cmd_args_t args = {
+                    .cmd = (uint32_t)GDO_DOOR_ACTION_STOP,
+                    .door_cmd = true,
+                };
+                if (schedule_command(&args, delay_ms * 1000) != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to schedule the second press to stop the door");
                 }
             }
         } else if (door_state != GDO_DOOR_STATE_STOPPED || elapsed > V1_STOP_REVERSE_WINDOW_MS) {
