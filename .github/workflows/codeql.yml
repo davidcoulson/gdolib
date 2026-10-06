@@ -1,0 +1,40 @@
+# CodeQL analysis for gdolib.
+#
+# This lives only on davidcoulson/gdolib (master and ratgdo-c5), not on the
+# branches sent upstream to konnected-io/gdolib, so upstream PRs stay clean.
+# gdolib is an ESP-IDF component with no standalone build, so C/C++ is
+# analyzed with build-mode: none (source-level extraction, no compiler).
+
+name: CodeQL
+
+on:
+  push:
+    branches: [master, ratgdo-c5]
+  pull_request:
+    branches: [master, ratgdo-c5]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (c-cpp)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: none
+          queries: security-and-quality
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:c-cpp
