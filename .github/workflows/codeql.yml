@@ -38,3 +38,13 @@ jobs:
       - uses: github/codeql-action/analyze@v3
         with:
           category: /language:c-cpp
+          output: sarif-results
+
+      # Keep the raw results as an artifact too, so they can be read without
+      # the code-scanning UI.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codeql-sarif
+          path: sarif-results
+          retention-days: 30
