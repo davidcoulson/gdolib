@@ -19,6 +19,7 @@
 
 #include "gdo.h"
 #include "gdo_priv.h"
+#include "esp_timer.h"
 
 const char *gdo_door_state_str[] = {
     "Unknown",
@@ -209,9 +210,9 @@ void print_buffer(gdo_protocol_type_t protocol, uint8_t* buf, bool is_tx) {
                  buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
                  buf[10], buf[11], buf[12],buf[13], buf[14], buf[15], buf[16], buf[17], buf[18]);
     } else if (is_tx) {
-        ESP_LOGD(TAG, "TX [%02X]", buf[0]);
+        ESP_LOGW(TAG, "DBG t=%lu TX [%02X]", (unsigned long)(esp_timer_get_time() / 1000), buf[0]);
     } else {
-        ESP_LOGD(TAG, "RX [%02X %02X]", buf[0], buf[1]);
+        ESP_LOGW(TAG, "DBG t=%lu RX [%02X %02X]", (unsigned long)(esp_timer_get_time() / 1000), buf[0], buf[1]);
     }
 }
 

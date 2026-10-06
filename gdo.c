@@ -519,6 +519,8 @@ esp_err_t gdo_door_close(void) {
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_door_stop(void) {
+    ESP_LOGW(TAG, "DBG t=%lu gdo_door_stop door=%s", (unsigned long)(esp_timer_get_time() / 1000),
+             gdo_door_state_to_string(g_status.door));
     if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
         esp_err_t err = send_door_action(GDO_DOOR_ACTION_STOP);
         // Security+ 1.0 has no stop command, only the wall-button press, and the opener
@@ -539,6 +541,8 @@ esp_err_t gdo_door_stop(void) {
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_door_toggle(void) {
+    ESP_LOGW(TAG, "DBG t=%lu gdo_door_toggle door=%s", (unsigned long)(esp_timer_get_time() / 1000),
+             gdo_door_state_to_string(g_status.door));
     // On Security+ 1.0 a toggle is exactly one wall-button press, so it keeps the opener's
     // own semantics (a press while closing reverses) rather than the two-press stop.
     if (!(g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) &&
@@ -2114,7 +2118,8 @@ static void update_door_state(const gdo_door_state_t door_state) {
         return;
     }
 
-    ESP_LOGD(TAG, "Door state: %s", gdo_door_state_to_string(door_state));
+    ESP_LOGW(TAG, "DBG t=%lu door %s -> %s", (unsigned long)(esp_timer_get_time() / 1000),
+             gdo_door_state_to_string(g_status.door), gdo_door_state_to_string(door_state));
 
     if (g_v1_stop_pending_ms) {
         // The reversal can pass through STOPPED on its way to OPENING, so keep waiting then.
