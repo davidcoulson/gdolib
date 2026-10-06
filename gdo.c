@@ -96,6 +96,8 @@ static gdo_status_t g_status = {
 static bool g_protocol_forced;
 static gdo_config_t g_config;
 static uint32_t g_door_start_moving_ms;
+// Security+ 1.0: time of the press that reversed a closing door for gdo_door_stop(); 0 if none.
+static uint32_t g_v1_stop_pending_ms;
 static TaskHandle_t gdo_main_task_handle;
 static TaskHandle_t gdo_sync_task_handle;
 static QueueHandle_t gdo_tx_queue;
@@ -121,6 +123,9 @@ static const uint32_t MOVE_TO_TARGET_NEAR_THRESHOLD = 200;
 // dance is taken — that dance schedules toggles at +500ms and +1000ms before
 // motion starts, so STOP needs to be pushed out to align the motor pulse.
 static const uint32_t MOVE_TO_TARGET_TOGGLE_DANCE_MS = 1000;
+// Security+ 1.0 stop while closing: the second press is sent only if the opener reports
+// opening within this window of the first. Past it the reversal is left alone (door opens).
+static const uint32_t V1_STOP_REVERSE_WINDOW_MS = 3000;
 
 // Security+ 2.0 obstruction timing, measured on a live opener (see issue #28):
 //   - each frame is retransmitted ~74ms apart (same rolling code);
@@ -473,7 +478,15 @@ esp_err_t gdo_door_close(void) {
 */
 esp_err_t gdo_door_stop(void) {
     if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
-        return send_door_action(GDO_DOOR_ACTION_STOP);
+        esp_err_t err = send_door_action(GDO_DOOR_ACTION_STOP);
+        // Security+ 1.0 has no stop command, only the wall-button press, and the opener
+        // reverses on a press while closing. Press again once it reports opening; a press
+        // while opening stops it.
+        if (err == ESP_OK && (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) &&
+            g_status.door == GDO_DOOR_STATE_CLOSING) {
+            g_v1_stop_pending_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        }
+        return err;
     }
 
     return ESP_OK;
@@ -484,7 +497,10 @@ esp_err_t gdo_door_stop(void) {
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
 esp_err_t gdo_door_toggle(void) {
-    if (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING) {
+    // On Security+ 1.0 a toggle is exactly one wall-button press, so it keeps the opener's
+    // own semantics (a press while closing reverses) rather than the two-press stop.
+    if (!(g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) &&
+        (g_status.door == GDO_DOOR_STATE_OPENING || g_status.door == GDO_DOOR_STATE_CLOSING)) {
         return gdo_door_stop();
     }
 
@@ -1861,6 +1877,22 @@ static void update_door_state(const gdo_door_state_t door_state) {
     }
 
     ESP_LOGD(TAG, "Door state: %s", gdo_door_state_to_string(door_state));
+
+    if (g_v1_stop_pending_ms) {
+        // The reversal can pass through STOPPED on its way to OPENING, so keep waiting then.
+        uint32_t elapsed = (uint32_t)(esp_timer_get_time() / 1000) - g_v1_stop_pending_ms;
+        if (door_state == GDO_DOOR_STATE_OPENING) {
+            g_v1_stop_pending_ms = 0;
+            if (elapsed <= V1_STOP_REVERSE_WINDOW_MS) {
+                ESP_LOGI(TAG, "Stop while closing: reversed after %" PRIu32 "ms, pressing again to stop", elapsed);
+                if (send_door_action(GDO_DOOR_ACTION_STOP) != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to send the second press to stop the door");
+                }
+            }
+        } else if (door_state != GDO_DOOR_STATE_STOPPED || elapsed > V1_STOP_REVERSE_WINDOW_MS) {
+            g_v1_stop_pending_ms = 0;
+        }
+    }
 
     if (!g_status.open_ms) {
         if (door_state == GDO_DOOR_STATE_OPENING && g_status.door == GDO_DOOR_STATE_CLOSED) {
