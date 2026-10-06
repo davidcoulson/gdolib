@@ -2,8 +2,11 @@
 #
 # This lives only on davidcoulson/gdolib (master and ratgdo-c5), not on the
 # branches sent upstream to konnected-io/gdolib, so upstream PRs stay clean.
-# gdolib is an ESP-IDF component with no standalone build, so C/C++ is
-# analyzed with build-mode: none (source-level extraction, no compiler).
+#
+# gdolib is an ESP-IDF component with no standalone build, and without the
+# ESP-IDF headers CodeQL's source-only mode can't parse most of gdo.c. So the
+# job runs in Espressif's ESP-IDF container and traces a real build of the
+# examples/ host project with gdolib added as a component.
 
 name: CodeQL
 
@@ -21,23 +24,37 @@ permissions:
 
 jobs:
   analyze:
-    name: Analyze (c-cpp)
+    name: Analyze (c-cpp, ESP-IDF build)
     runs-on: ubuntu-latest
+    container: espressif/idf:release-v5.5
     permissions:
       contents: read
       security-events: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The checkout directory name becomes the ESP-IDF component name.
+          path: gdolib
 
       - uses: github/codeql-action/init@v3
         with:
           languages: c-cpp
-          build-mode: none
+          build-mode: manual
           queries: security-and-quality
+          source-root: gdolib
+
+      - name: Build examples/ with gdolib (ESP32-C5)
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          cp -r gdolib/examples /tmp/host
+          cd /tmp/host
+          idf.py -DEXTRA_COMPONENT_DIRS="$GITHUB_WORKSPACE/gdolib" set-target esp32c5 build
 
       - uses: github/codeql-action/analyze@v3
         with:
           category: /language:c-cpp
+          checkout_path: gdolib
           output: sarif-results
 
       # Keep the raw results as an artifact too, so they can be read without
