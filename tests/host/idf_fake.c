@@ -142,6 +142,11 @@ esp_err_t esp_timer_delete(esp_timer_handle_t t) { free(t); return ESP_OK; }
 /* ---- gpio ---- */
 esp_err_t gpio_config(const gpio_config_t *cfg) { (void)cfg; return ESP_OK; }
 esp_err_t gpio_reset_pin(gpio_num_t pin) { (void)pin; return ESP_OK; }
+esp_err_t gpio_set_level(gpio_num_t pin, uint32_t level) { (void)pin; (void)level; return ESP_OK; }
+esp_err_t gpio_set_pull_mode(gpio_num_t pin, gpio_pull_mode_t mode) { (void)pin; (void)mode; return ESP_OK; }
+esp_err_t gpio_set_direction(gpio_num_t pin, gpio_mode_t mode) { (void)pin; (void)mode; return ESP_OK; }
+esp_err_t gpio_hold_en(gpio_num_t pin) { (void)pin; return ESP_OK; }
+esp_err_t gpio_hold_dis(gpio_num_t pin) { (void)pin; return ESP_OK; }
 int gpio_get_level(gpio_num_t pin) { (void)pin; return 0; }
 esp_err_t gpio_install_isr_service(int flags) { (void)flags; return ESP_OK; }
 esp_err_t gpio_isr_handler_add(gpio_num_t pin, void (*isr)(void *), void *arg) {

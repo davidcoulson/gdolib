@@ -107,10 +107,11 @@ esp_err_t esp_timer_delete(esp_timer_handle_t t);
 /* ---- gpio ---- */
 typedef int gpio_num_t;
 #define GPIO_NUM_MAX 49
-typedef enum { GPIO_MODE_INPUT = 1 } gpio_mode_t;
+typedef enum { GPIO_MODE_INPUT = 1, GPIO_MODE_OUTPUT = 2 } gpio_mode_t;
 typedef enum { GPIO_PULLUP_DISABLE = 0, GPIO_PULLUP_ENABLE } gpio_pullup_t;
 typedef enum { GPIO_PULLDOWN_DISABLE = 0, GPIO_PULLDOWN_ENABLE } gpio_pulldown_t;
 typedef enum { GPIO_INTR_DISABLE = 0, GPIO_INTR_NEGEDGE = 2 } gpio_int_type_t;
+typedef enum { GPIO_PULLUP_ONLY, GPIO_PULLDOWN_ONLY, GPIO_PULLUP_PULLDOWN, GPIO_FLOATING } gpio_pull_mode_t;
 typedef struct {
     uint64_t pin_bit_mask;
     gpio_mode_t mode;
@@ -120,6 +121,11 @@ typedef struct {
 } gpio_config_t;
 esp_err_t gpio_config(const gpio_config_t *cfg);
 esp_err_t gpio_reset_pin(gpio_num_t pin);
+esp_err_t gpio_set_level(gpio_num_t pin, uint32_t level);
+esp_err_t gpio_set_pull_mode(gpio_num_t pin, gpio_pull_mode_t mode);
+esp_err_t gpio_set_direction(gpio_num_t pin, gpio_mode_t mode);
+esp_err_t gpio_hold_en(gpio_num_t pin);
+esp_err_t gpio_hold_dis(gpio_num_t pin);
 int gpio_get_level(gpio_num_t pin);
 esp_err_t gpio_install_isr_service(int flags);
 esp_err_t gpio_isr_handler_add(gpio_num_t pin, void (*isr)(void *), void *arg);
