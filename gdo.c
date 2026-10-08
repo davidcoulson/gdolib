@@ -147,6 +147,10 @@ static const uint32_t V1_STOP_PRESS_DELAY_MS = 400;
 // arrive about once a second, so this leaves room for one before the next check.
 static const uint32_t V1_STOP_VERIFY_MS = 2000;
 static const uint8_t V1_STOP_MAX_PRESSES = 3;
+// Security+ 1.0 door/light press: time from press to release. Was the 50 ms TX interval;
+// esphome-ratgdo holds 500 ms. Kept under the 500 ms spacing of the toggle-only reverse
+// sequence (toggle_with_reverse) so a release never lands on the next press.
+static const uint32_t V1_PRESS_HOLD_MS = 250;
 
 // Security+ 2.0 obstruction timing, measured on a live opener (see issue #28):
 //   - each frame is retransmitted ~74ms apart (same rolling code);
@@ -1519,7 +1523,9 @@ static esp_err_t gdo_v1_toggle_cmd(gdo_v1_command_t cmd) {
             .cmd = (uint32_t)cmd + 1, // release is always 1 higher than press
             .door_cmd = false,
         };
-        return schedule_command(&args, g_tx_delay_ms * 1000);
+        // Hold door and light presses like a wall button would; the lock keeps the old timing.
+        uint32_t hold_ms = cmd == V1_CMD_TOGGLE_LOCK_PRESS ? g_tx_delay_ms : V1_PRESS_HOLD_MS;
+        return schedule_command(&args, hold_ms * 1000);
     }
 
     return err;
@@ -1552,6 +1558,9 @@ static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t by
     gdo_tx_message_t message;
     message.cmd = command;
     message.packet = (uint8_t*)malloc(19); // will be freed in the gdo_main_task
+    if (!message.packet) {
+        return ESP_ERR_NO_MEM;
+    }
     message.sent_ms = esp_timer_get_time() / 1000;
 
     // if we are here without a protocol defined then V1 testing failed, proceed with v2
@@ -1572,6 +1581,7 @@ static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t by
 
     print_buffer(g_status.protocol, message.packet, true);
     if (xQueueSendToBack(gdo_tx_queue, &message, 0) == pdFALSE) {
+        free(message.packet);
         return ESP_ERR_NO_MEM;
     }
 
@@ -2209,6 +2219,8 @@ static void update_door_state(const gdo_door_state_t door_state) {
     if (door_state == GDO_DOOR_STATE_OPENING || door_state == GDO_DOOR_STATE_CLOSING) {
         if (g_status.door_position >= 0 && g_status.close_ms > 0 && g_status.open_ms > 0) {
             g_door_start_moving_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            // A reversal goes closing -> opening with the timer still running; restart it.
+            esp_timer_stop(door_position_sync_timer);
             if (esp_timer_start_periodic(door_position_sync_timer, 500 * 1000) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to start door position sync timer");
             }
