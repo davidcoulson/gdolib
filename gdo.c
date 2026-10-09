@@ -1103,9 +1103,9 @@ static void gdo_sync_task(void* arg) {
     }
 
 done:
-    ESP_LOGW(TAG, "DBG t=%lu sync done synced=%d protocol=%d door=%d openings=%u rolling=%" PRIu32,
+    ESP_LOGW(TAG, "DBG t=%lu sync done synced=%d protocol=%d door=%d openings=%u rolling=%" PRIu32 " rx_pin=%d",
              (unsigned long)(esp_timer_get_time() / 1000), synced, g_status.protocol, g_status.door,
-             (unsigned)g_status.openings, g_status.rolling_code);
+             (unsigned)g_status.openings, g_status.rolling_code, gpio_get_level(g_config.uart_rx_pin));
     g_status.synced = synced;
 
     if (synced) {
@@ -2050,6 +2050,11 @@ static void gdo_main_task(void* arg) {
                         break;
                     }
 
+                    static uint32_t busy_count = 0;
+                    if ((++busy_count % 20) == 1) {
+                        ESP_LOGW(TAG, "DBG t=%lu TX deferred, bus busy: rx_pending=%d rx_pin=%d (x%" PRIu32 ")",
+                                 (unsigned long)now, rx_pending, gpio_get_level(g_config.uart_rx_pin), busy_count);
+                    }
                     ESP_LOGD(TAG, "Collision detected, requeuing command");
                     // Wait 150ms for the collision to clear
                     if (schedule_event(GDO_EVENT_TX_PENDING, 150 * 1000) != ESP_OK) {
@@ -2060,6 +2065,8 @@ static void gdo_main_task(void* arg) {
 
                 err = ESP_OK;
                 if (xQueueReceive(gdo_tx_queue, &tx_message, 0) == pdTRUE) {
+                    ESP_LOGW(TAG, "DBG t=%lu TX sending cmd=0x%03x age=%lums", (unsigned long)now,
+                             (unsigned)tx_message.cmd, (unsigned long)(now - tx_message.sent_ms));
                     if (now - tx_message.sent_ms > 3000) {
                         err = ESP_ERR_TIMEOUT;
                     } else {
