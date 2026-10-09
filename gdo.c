@@ -417,6 +417,9 @@ done:
  * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails, ESP_ERR_INVALID_STATE if the driver is not initialized.
 */
 esp_err_t gdo_start(gdo_event_callback_t event_callback, void *user_arg) {
+    ESP_LOGW(TAG, "DBG t=%lu gdo_start client_id=0x%08" PRIx32 " rolling_code=%" PRIu32 " protocol=%d forced=%d",
+             (unsigned long)(esp_timer_get_time() / 1000), g_status.client_id, g_status.rolling_code,
+             g_status.protocol, g_protocol_forced);
     if (!gdo_tx_queue) { // using this as a proxy for the driver being initialized
         return ESP_ERR_INVALID_STATE;
     }
@@ -1100,6 +1103,9 @@ static void gdo_sync_task(void* arg) {
     }
 
 done:
+    ESP_LOGW(TAG, "DBG t=%lu sync done synced=%d protocol=%d door=%d openings=%u rolling=%" PRIu32,
+             (unsigned long)(esp_timer_get_time() / 1000), synced, g_status.protocol, g_status.door,
+             (unsigned)g_status.openings, g_status.rolling_code);
     g_status.synced = synced;
 
     if (synced) {
@@ -1569,6 +1575,8 @@ static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t by
         uint64_t fixed = ((cmd & ~0xff) << 24) | g_status.client_id;
         uint32_t data = (byte2 << 24) | (byte1 << 16) | (nibble << 8) | (cmd & 0xff);
 
+        ESP_LOGW(TAG, "DBG t=%lu TX cmd=0x%03x rolling=%" PRIu32 " client=0x%08" PRIx32,
+                 (unsigned long)(esp_timer_get_time() / 1000), (unsigned)command, g_status.rolling_code, g_status.client_id);
         if (encode_wireline(g_status.rolling_code, fixed, data, message.packet) != 0) {
             free(message.packet);
             return ESP_FAIL;
@@ -1714,17 +1722,17 @@ static void decode_packet(uint8_t *packet) {
     static bool obst_trailing_edge_pending = false;
 
     if (decode_wireline(packet, &rolling, &fixed, &data) != 0) {
-        ESP_LOGD(TAG, "Failed to decode wireline frame; dropping");
+        ESP_LOGW(TAG, "DBG t=%lu RX undecodable frame; dropping", (unsigned long)time_now);
         return;
     }
 
     data &= ~0xf000;
 
     if ((fixed & 0xFFFFFFFF) == g_status.client_id) { // my commands
-        ESP_LOGE(TAG, "received mine: rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
+        ESP_LOGW(TAG, "DBG received mine: rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
         return;
     } else {
-        ESP_LOGI(TAG, "received rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, rolling, fixed, data);
+        ESP_LOGW(TAG, "DBG t=%lu RX rolling=%07" PRIx32 " fixed=%010" PRIx64 " data=%08" PRIx32, (unsigned long)time_now, rolling, fixed, data);
     }
 
     gdo_command_t cmd = ((fixed >> 24) & 0xf00) | (data & 0xff);
