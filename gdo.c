@@ -151,6 +151,9 @@ static const uint8_t V1_STOP_MAX_PRESSES = 3;
 // esphome-ratgdo holds 500 ms. Kept under the 500 ms spacing of the toggle-only reverse
 // sequence (toggle_with_reverse) so a release never lands on the next press.
 static const uint32_t V1_PRESS_HOLD_MS = 250;
+// A Sec+ v2 frame follows its break within a few ms; RX pending this long with no RX
+// event means the break was a glitch and no frame is coming.
+static const uint32_t RX_PENDING_STALE_MS = 500;
 
 // Security+ 2.0 obstruction timing, measured on a live opener (see issue #28):
 //   - each frame is retransmitted ~74ms apart (same rolling code);
@@ -365,6 +368,14 @@ esp_err_t gdo_deinit(void) {
         obst_timer = NULL;
     }
 
+    if (g_v1_stop_timer) {
+        esp_timer_stop(g_v1_stop_timer);
+        esp_timer_delete(g_v1_stop_timer);
+        g_v1_stop_timer = NULL;
+    }
+    g_v1_stop_pending_ms = 0;
+    g_v1_stop_presses_left = 0;
+
     if (obst_verify_timer) {
         esp_timer_stop(obst_verify_timer);
         esp_timer_delete(obst_verify_timer);
@@ -429,7 +440,7 @@ esp_err_t gdo_start(gdo_event_callback_t event_callback, void *user_arg) {
 
     uart_flush(g_config.uart_num);
 
-    if (xTaskCreate(gdo_main_task, "gdo_main_task", 4096, NULL, 15, &gdo_main_task_handle) != pdPASS) {
+    if (xTaskCreate(gdo_main_task, "gdo_main_task", 6144, NULL, 15, &gdo_main_task_handle) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1844,6 +1855,9 @@ static void gdo_main_task(void* arg) {
     uint8_t rx_buffer[RX_BUFFER_SIZE * 2]; // double the size to prevent overflow
     uint16_t rx_buf_index = 0;
     uint8_t rx_pending = 0;
+    // Last UART_BREAK/UART_DATA event, to spot an rx_pending left set by a break that was
+    // never followed by data (see RX_PENDING_STALE_MS).
+    uint32_t last_rx_event_ms = 0;
     gdo_tx_message_t tx_message = {};
     gdo_event_t event = {};
     gdo_cb_event_t cb_event = GDO_CB_EVENT_MAX;
@@ -1876,12 +1890,14 @@ static void gdo_main_task(void* arg) {
 
             switch ((int)event.gdo_event) {
             case UART_BREAK:
+                last_rx_event_ms = esp_timer_get_time() / 1000;
                 // All messages from the GDO start with a break if using V2 protocol.
                 if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
                     ++rx_pending;
                 }
                 break;
             case UART_DATA: {
+                last_rx_event_ms = esp_timer_get_time() / 1000;
                 uint16_t rx_packet_size = event.uart_event.size;
                 if (!g_status.protocol) {
                     if (rx_packet_size == 2) {
@@ -2032,6 +2048,17 @@ static void gdo_main_task(void* arg) {
                         ESP_LOGE(TAG, "Failed to schedule TX pending event, %s", esp_err_to_name(err));
                     }
                     break;
+                }
+
+                if (rx_pending && now - last_rx_event_ms > RX_PENDING_STALE_MS &&
+                    !gpio_get_level(g_config.uart_rx_pin)) {
+                    // A break with no data after it (e.g. the glitch as TX is handed to the
+                    // UART on a cold boot) leaves rx_pending set forever; every TX is then
+                    // treated as a collision and, before sync, dropped - so it never syncs.
+                    ESP_LOGW(TAG, "Clearing stale RX pending (%u) after %" PRIu32 "ms with no RX data",
+                             rx_pending, now - last_rx_event_ms);
+                    rx_pending = 0;
+                    uart_flush_input(g_config.uart_num);
                 }
 
                 if (rx_pending || gpio_get_level(g_config.uart_rx_pin)) {
