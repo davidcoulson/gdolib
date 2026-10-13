@@ -33,6 +33,7 @@ static void door_position_sync_timer_cb(void* arg);
 static void scheduled_cmd_timer_cb(void* arg);
 static void scheduled_event_timer_cb(void* arg);
 static void obst_timer_cb(void* arg);
+static void obst_verify_timer_cb(void* arg);
 static void get_paired_devices(gdo_paired_device_type_t type);
 static void update_light_state(gdo_light_state_t light_state);
 static void update_lock_state(gdo_lock_state_t lock_state);
@@ -103,6 +104,7 @@ static QueueHandle_t gdo_event_queue;
 static esp_timer_handle_t motion_detect_timer;
 static esp_timer_handle_t door_position_sync_timer;
 static esp_timer_handle_t obst_timer;
+static esp_timer_handle_t obst_verify_timer;
 static void *g_user_cb_arg;
 static uint32_t g_tx_delay_ms = 50;
 static portMUX_TYPE gdo_spinlock = portMUX_INITIALIZER_UNLOCKED;
@@ -142,6 +144,17 @@ static const uint32_t OBST_STATUS_CLEAR_GUARD_MS = 5000;
 // an unused flag can never swallow a later genuine trip. The window sits below the minimum
 // observed real-edge spacing (~1055ms) so a genuine re-break still registers.
 static const uint32_t OBST_TRAILING_EDGE_WINDOW_MS = 1000;
+// Minimum spacing between GET_STATUS requests sent to recover from a misaligned Sec+ v2
+// RX stream. Each request spends a rolling code, so a burst of line noise must not turn
+// into a burst of transmissions.
+static const uint32_t RX_RESYNC_STATUS_INTERVAL_MS = 3000;
+// While "obstructed", poll STATUS this long after the last trip and keep polling until it
+// reads clear. Every other repair path waits for a frame the opener sends unprompted, and
+// the opener transmits nothing while idle -- so a desync (a dropped or coalesced OBST_1
+// edge, a missing 0x09) would otherwise stick at "obstructed" until the next door move or
+// a reboot. Longer than both the ~4.4s STATUS lag and OBST_STATUS_CLEAR_GUARD_MS, so the
+// reply carries the current beam state and its "clear" is accepted.
+static const uint32_t OBST_VERIFY_INTERVAL_MS = 6000;
 
 
 /******************************* PUBLIC API FUNCTIONS **********************************/
@@ -223,6 +236,17 @@ esp_err_t gdo_init(const gdo_config_t *config) {
         }
     }
 
+    if (g_config.obst_from_status) {
+        timer_args.callback = obst_verify_timer_cb;
+        timer_args.arg = NULL;
+        timer_args.dispatch_method = ESP_TIMER_TASK;
+        timer_args.name = "obst_verify_timer";
+        err = esp_timer_create(&timer_args, &obst_verify_timer);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
     // Begin in secplus protocol v1 as its the easiest to detect.
     uart_config_t uart_config = {
         .baud_rate  = 1200,
@@ -248,6 +272,14 @@ esp_err_t gdo_init(const gdo_config_t *config) {
     err = uart_set_pin(g_config.uart_num, g_config.uart_tx_pin, g_config.uart_rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         return err;
+    }
+
+    // gdo_deinit() may have left TX held at its idle level across a restart. Release the
+    // hold only now that the UART (already configured above, including inversion) owns
+    // the pin: releasing it first would let the pad fall back to its default state, which
+    // can include the pull-up, until uart_set_pin() ran.
+    if (gpio_hold_dis(g_config.uart_tx_pin) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not release the hold on TX pin %d", g_config.uart_tx_pin);
     }
 
     gdo_tx_queue = xQueueCreate(16, sizeof(gdo_tx_message_t));
@@ -304,6 +336,12 @@ esp_err_t gdo_deinit(void) {
         obst_timer = NULL;
     }
 
+    if (obst_verify_timer) {
+        esp_timer_stop(obst_verify_timer);
+        esp_timer_delete(obst_verify_timer);
+        obst_verify_timer = NULL;
+    }
+
     g_protocol_forced = false;
     g_status.synced = false;
     g_status.protocol = 0;
@@ -327,9 +365,23 @@ esp_err_t gdo_deinit(void) {
     g_status.door_position = -1;
     g_status.door_target = -1;
 
-    err = gpio_reset_pin(g_config.uart_tx_pin);
+    // Park TX at the UART idle level instead of gpio_reset_pin(), which enables the pull-up:
+    // with an inverted UART that is the "button pressed" level and holds it across a restart.
+    // Set the level, then route the pin to the GPIO output register (it is still muxed to the
+    // UART TX signal) and hold it, so it stays idle through a restart.
+    err = gpio_set_level(g_config.uart_tx_pin, g_config.invert_uart ? 0 : 1);
     if (err != ESP_OK) {
         goto done;
+    }
+
+    err = gpio_set_direction(g_config.uart_tx_pin, GPIO_MODE_OUTPUT);
+    if (err != ESP_OK) {
+        goto done;
+    }
+
+    if (gpio_hold_en(g_config.uart_tx_pin) != ESP_OK) {
+        // Not fatal: the pin may not support hold; it is still parked until the restart.
+        ESP_LOGW(TAG, "Could not hold TX pin %d at idle", g_config.uart_tx_pin);
     }
 
     err = gpio_reset_pin(g_config.uart_rx_pin);
@@ -1090,6 +1142,22 @@ static void motion_detect_timer_cb(void* arg) {
 }
 
 /**
+ * @brief Started when obstruction (from status) goes to obstructed. While still obstructed,
+ * requests a STATUS every OBST_VERIFY_INTERVAL_MS so a desynced "obstructed" is repaired
+ * even when the opener is idle and sending nothing. decode_packet applies the reply.
+*/
+static void obst_verify_timer_cb(void* arg) {
+    if (g_status.obstruction != GDO_OBSTRUCTION_STATE_OBSTRUCTED ||
+        g_status.protocol != GDO_PROTOCOL_SEC_PLUS_V2) {
+        return;
+    }
+
+    ESP_LOGD(TAG, "Obstruction still set, requesting status to verify");
+    get_status();
+    esp_timer_start_once(obst_verify_timer, OBST_VERIFY_INTERVAL_MS * 1000);
+}
+
+/**
  * @brief This timer is started when the door starts moving and will queue an event of
  * `GDO_EVENT_DOOR_POSITION_UPDATE` every 500ms until the door stops.
 */
@@ -1590,8 +1658,28 @@ static void gdo_main_task(void* arg) {
     gdo_cb_event_t cb_event = GDO_CB_EVENT_MAX;
     esp_err_t err = ESP_OK;
     uint32_t last_tx_time = 0;
+    // Set when the Sec+ v2 RX stream was flushed to realign it after a framing error.
+    bool fetch_status = false;
+    uint32_t last_status_ms = 0;
 
     for (;;) {
+        // The flush may have dropped a frame; the opener normally retransmits it, but ask
+        // for status in case it didn't. Rate-limited since each request spends a rolling
+        // code, and skipped before sync since the sync task is already querying the opener.
+        if (fetch_status) {
+            fetch_status = false;
+            uint32_t now = esp_timer_get_time() / 1000;
+            if (g_status.synced && now - last_status_ms >= RX_RESYNC_STATUS_INTERVAL_MS) {
+                ESP_LOGW(TAG, "RX stream misaligned, flushed and requesting status");
+                err = get_status();
+                if (err == ESP_OK) {
+                    last_status_ms = now;
+                } else {
+                    ESP_LOGE(TAG, "Failed to request status after RX resync: %s", esp_err_to_name(err));
+                }
+            }
+        }
+
         if (xQueueReceive(gdo_event_queue, (void*)&event, (TickType_t)portMAX_DELAY)) {
             cb_event = GDO_CB_EVENT_MAX;
 
@@ -1654,18 +1742,33 @@ static void gdo_main_task(void* arg) {
                     }
 
                     while(rx_pending) {
-                        if (uart_read_bytes(g_config.uart_num, rx_buffer, GDO_PACKET_SIZE, 0) == GDO_PACKET_SIZE) {
+                        int bytes_read = uart_read_bytes(g_config.uart_num, rx_buffer, GDO_PACKET_SIZE, 0);
+                        if (bytes_read == GDO_PACKET_SIZE) {
                             // check for the GDO packet start (0x55 0x01 0x00)
                             if (memcmp(rx_buffer, "\x55\x01\x00", 3) != 0) {
                                 ESP_LOGE(TAG, "RX data signature error: 0x%02x%02x%02x", rx_buffer[0], rx_buffer[1], rx_buffer[2]);
-                                rx_pending--;
-                                continue;
+                                // Every later read would straddle two frames; flush to land the
+                                // next one on a frame boundary.
+                                uart_flush_input(g_config.uart_num);
+                                rx_pending = 0;
+                                fetch_status = true;
+                                break;
                             }
 
                             print_buffer(g_status.protocol, rx_buffer, false);
                             decode_packet(rx_buffer);
+                        } else if (bytes_read > 0) {
+                            // Consumed part of a frame, so the next read would start mid-frame.
+                            ESP_LOGE(TAG, "RX short read, %d bytes, %u pending messages.", bytes_read, rx_pending);
+                            uart_flush_input(g_config.uart_num);
+                            rx_pending = 0;
+                            fetch_status = true;
+                            break;
                         } else {
-                            ESP_LOGE(TAG, "RX buffer read error, %u pending messages.", rx_pending);
+                            // Nothing buffered, so the stream is still aligned. rx_pending over-counts
+                            // when line noise produces extra breaks, or when transmit_packet() flushed
+                            // bytes whose UART events are still queued.
+                            ESP_LOGD(TAG, "RX buffer empty, %u pending messages.", rx_pending);
                         }
                         --rx_pending;
                     }
@@ -1959,6 +2062,11 @@ static void get_paired_devices(gdo_paired_device_type_t type) {
  * @brief Gets the current status of the GDO.
 */
 inline static esp_err_t get_status() {
+    // Security+ 1.0 has no status request: the wall panel (or the emulation timer) polls
+    // status. Like learn and clear-paired, this is a Security+ 2.0-only command.
+    if (g_status.protocol != GDO_PROTOCOL_SEC_PLUS_V2) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     return queue_command(GDO_CMD_GET_STATUS, 0, 0, 0);
 }
 
@@ -2029,6 +2137,12 @@ inline static void update_obstruction_state(gdo_obstruction_state_t obstruction_
     ESP_LOGD(TAG, "Obstruction state: %s", gdo_obstruction_state_to_string(obstruction_state));
     g_status.obstruction = obstruction_state;
     queue_event((gdo_event_t){GDO_EVENT_OBST});
+
+    // (Re)start the verify poll from this trip, so its first STATUS lands past the lag.
+    if (obstruction_state == GDO_OBSTRUCTION_STATE_OBSTRUCTED && obst_verify_timer) {
+        esp_timer_stop(obst_verify_timer);
+        esp_timer_start_once(obst_verify_timer, OBST_VERIFY_INTERVAL_MS * 1000);
+    }
 }
 
 /**
